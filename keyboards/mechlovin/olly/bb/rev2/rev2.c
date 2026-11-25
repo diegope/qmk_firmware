@@ -14,6 +14,7 @@
  */
 
 #include "quantum.h"
+#include "usb_device_state.h"
 
 void board_init(void) {
     AFIO->MAPR |= AFIO_MAPR_SPI1_REMAP;
@@ -22,12 +23,9 @@ void board_init(void) {
 }
 
 void led_init_ports(void) {
-  // Lock indicator pins. Overriding led_init_ports() skips QMK's default
-  // init, so these must be set as outputs here or they stay inputs and the
-  // LEDs only glow faintly through the internal pull-up.
-  gpio_set_pin_output(B11); // scroll lock (right)
-  gpio_set_pin_output(B10); // caps lock (middle)
-  gpio_set_pin_output(B0);  // num lock (left)
+  gpio_set_pin_output(B11); // right lock LED (scroll)
+  gpio_set_pin_output(B10); // middle lock LED (caps)
+  gpio_set_pin_output(B0);  // left lock LED (num)
   gpio_set_pin_output(B12);
   gpio_set_pin_output(A14);
   gpio_set_pin_output(A13);
@@ -37,41 +35,127 @@ void led_init_ports(void) {
 }
 
 
-layer_state_t layer_state_set_user(layer_state_t state)
-{
-  // if on layer 0, turn on B12 LED, otherwise off.
-    if (get_highest_layer(state) == 0) {
-        gpio_write_pin_high(B12);
-    } else {
-        gpio_write_pin_low(B12);
+// ---------------------------------------------------------------------------
+// Layer LEDs
+//
+// The five layer LEDs are dimmed with software PWM driven by a hardware
+// timer (TIM4), so they can fade. 64 brightness steps at 16 kHz gives a
+// 250 Hz PWM rate, which is flicker-free.
+//
+// What they show:
+//   - Space bar: all five flash on and fade out after release.
+//   - LEDs 1-4: held (or one-shot) modifiers: Shift, Ctrl, Alt, GUI.
+//   - LED 5: Fn held (any layer above the base layer).
+//   - Host asleep, or no host: all off.
+// ---------------------------------------------------------------------------
+
+static const pin_t layer_leds[] = {B12, A14, A13, A9, A10};
+#define LAYER_LED_COUNT (sizeof(layer_leds) / sizeof(layer_leds[0]))
+
+#define PWM_STEPS 64         // brightness levels per LED
+#define PWM_TICK_HZ 16000    // PWM_STEPS * 250 Hz
+#define FADE_MS 250          // space bar fade-out time
+
+// 0 = off, PWM_STEPS = fully on. Written by the main loop, read by the timer.
+static volatile uint8_t led_level[LAYER_LED_COUNT];
+
+static void pwm_tick(GPTDriver *gptp) {
+    (void)gptp;
+    static uint8_t phase = 0;
+    phase = (phase + 1) % PWM_STEPS;
+    for (uint8_t i = 0; i < LAYER_LED_COUNT; i++) {
+        gpio_write_pin(layer_leds[i], led_level[i] > phase);
     }
-  // if on layer 2, turn on A14 LED, otherwise off.
-    if (get_highest_layer(state) == 1) {
-        gpio_write_pin_high(A14);
-    } else {
-        gpio_write_pin_low(A14);
+}
+
+static const GPTConfig pwm_gpt_config = {
+    .frequency = 1000000, // 1 MHz timer clock
+    .callback  = pwm_tick,
+    .cr2       = 0,
+    .dier      = 0,
+};
+
+void keyboard_post_init_kb(void) {
+    gptStart(&GPTD4, &pwm_gpt_config);
+    gptStartContinuous(&GPTD4, 1000000 / PWM_TICK_HZ);
+    keyboard_post_init_user();
+}
+
+// Perceived brightness is roughly the square of the duty cycle, so square the
+// fade so it looks smooth to the eye. Input/output: 0..PWM_STEPS.
+static uint8_t perceptual(uint16_t linear) {
+    return (linear * linear + PWM_STEPS / 2) / PWM_STEPS;
+}
+
+static bool     space_held     = false;
+static bool     space_fading   = false;
+static uint16_t space_released = 0;
+
+bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
+    if (keycode == KC_SPC) {
+        space_held = record->event.pressed;
+        if (!space_held) {
+            space_fading   = true;
+            space_released = timer_read();
+        }
+    }
+    return process_record_user(keycode, record);
+}
+
+static bool host_active(void) {
+    return usb_device_state_get_configure_state() == USB_DEVICE_STATE_CONFIGURED;
+}
+
+static void set_all_levels(uint8_t level) {
+    for (uint8_t i = 0; i < LAYER_LED_COUNT; i++) {
+        led_level[i] = level;
+    }
+}
+
+// Runs every scan loop.
+void housekeeping_task_kb(void) {
+    if (!host_active()) {
+        set_all_levels(0);
+        housekeeping_task_user();
+        return;
     }
 
-  // if on layer 3, turn on A13 LED, otherwise off.
-    if (get_highest_layer(state) == 2   ) {
-        gpio_write_pin_high(A13);
-    } else {
-        gpio_write_pin_low(A13);
+    // Base state: which LEDs are on at full brightness.
+    // LEDs 1-4: held (or one-shot) modifiers. LED 5: Fn (any layer above 0).
+    uint8_t mask = 0;
+    uint8_t mods = get_mods() | get_oneshot_mods();
+    if (mods & MOD_MASK_SHIFT) mask |= 1 << 0;
+    if (mods & MOD_MASK_CTRL) mask |= 1 << 1;
+    if (mods & MOD_MASK_ALT) mask |= 1 << 2;
+    if (mods & MOD_MASK_GUI) mask |= 1 << 3;
+    if (get_highest_layer(layer_state | default_layer_state) > 0) mask |= 1 << 4;
+
+    // Space bar flash: full while held, then fade out.
+    uint8_t flash = 0;
+    if (space_held) {
+        flash = PWM_STEPS;
+    } else if (space_fading) {
+        uint16_t elapsed = timer_elapsed(space_released);
+        if (elapsed >= FADE_MS) {
+            space_fading = false;
+        } else {
+            flash = perceptual((uint32_t)PWM_STEPS * (FADE_MS - elapsed) / FADE_MS);
+        }
     }
 
-  // if on layer 3, turn on A10 LED, otherwise off.
-    if (get_highest_layer(state) == 3   ) {
-        gpio_write_pin_high(A9);
-    } else {
-        gpio_write_pin_low(A9);
+    for (uint8_t i = 0; i < LAYER_LED_COUNT; i++) {
+        uint8_t base = (mask & (1 << i)) ? PWM_STEPS : 0;
+        led_level[i] = base > flash ? base : flash;
     }
 
-  // if on layer 3, turn on A9 LED, otherwise off.
-    if (get_highest_layer(state) == 4   ) {
-        gpio_write_pin_high(A10);
-    } else {
-        gpio_write_pin_low(A10);
-    }
+    housekeeping_task_user();
+}
 
-    return state;
+// Host went to sleep: turn the layer LEDs off (housekeeping doesn't run
+// while suspended). The lock LEDs are handled by QMK.
+void suspend_power_down_kb(void) {
+    set_all_levels(0);
+    space_held   = false;
+    space_fading = false;
+    suspend_power_down_user();
 }

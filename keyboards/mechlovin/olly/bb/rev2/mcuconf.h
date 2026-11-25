@@ -22,3 +22,7 @@
 
 #undef STM32_SPI_USE_SPI1
 #define STM32_SPI_USE_SPI1 TRUE
+
+// TIM4 drives software PWM for the layer LEDs (fading).
+#undef STM32_GPT_USE_TIM4
+#define STM32_GPT_USE_TIM4 TRUE
